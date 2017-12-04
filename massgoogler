@@ -1,0 +1,274 @@
+#!/usr/bin/perl
+
+#
+#
+#
+
+use utf8;
+use strict;
+use autodie;
+use warnings; 
+use warnings    		qw< FATAL  utf8     >;
+use open        		qw< :std  :utf8     >;
+use charnames   		qw< :full >;
+use feature     		qw< unicode_strings >;# else lc( ) won't do unicode
+use File::Basename      qw< basename >;
+use Carp                qw< carp croak confess cluck >;
+use Encode              qw< encode decode >;
+use Unicode::Normalize  qw< NFD NFC >;
+use POSIX;
+use English 			qw( -no_match_vars ) ;
+use feature 			'say';
+use Getopt::Long;
+END { close STDOUT }
+$0 = basename($0);  # shorter messages
+$| = 1;
+# if the DATA filehandle is to be read as utf8 binary data
+# always use for binary data
+#binmode(DATA, ":utf8");
+
+
+#--- program constants
+#
+#iceweasel -new-tab https://www.google.com/search?q=\"Prima+della+rivoluzione\"+oboom.com+classic\|cinema\|movie 
+#iceweasel -new-tab www.some.web.site.com 
+my $cmdPrefix		=	"iceweasel -new-tab ";
+my $googlePrefix	=	" \'http://www.google.com.tr/webhp?#q=";	
+my $luckySuffix		=	"&btnI=I ";
+my $cmdSuffix		=	" \' "; 
+
+my $tempFile		=	"/tmp/massgoogle_strippedInputFile.txt";
+
+
+
+# --- useage message
+
+my $usageMessage=<<MSG;
+
+    massgoogler -i search_terms.txt 
+                             [--search=classic\|vintages [--search=...] ]
+                             [--lucky]
+                             [--lucky-plus ]
+                             [--start    12]
+                             [--rows     30]
+                             [--sleepSec  1]
+    
+    massgoogler -i website_addrs.txt 
+                             [--massOpen   ]
+                             [--prepend = "www."]
+                             [--dupPrepend = "www."]
+                             [--start    12]
+                             [--rows     30]
+                             [--sleepSec  1]
+							 
+
+where:
+
+   -i              the file listing the search terms, one per line
+   [--search=...]  a string to add to the search page
+   [--lucky]       forward to the "I feel lucky" page 
+   [--lucky-plus]  forward to the "I feel lucky" page AND show google search
+   [--massOpen]   just open the web addresses (NO google search)
+   [--start n]     start on the nth non-comment, non-empty row [default=1]
+   [--rows n]      how many non-comment, non-empty rows to process [all]
+   [--sleepSec n]  how many seconds to sleep between searches [1]
+   [--prepend = "www."]      prepend "xxxx" to each web address (only)
+   [--dupprepend = "www."]   prepend "xxxx" to each web address, and do orig addr
+
+
+	
+Currently, for this simple program to work properly:
+* 	firefox/iceweasel must be already running, and
+* 	for --lucky to work: set google to settings > 'never show instant results'
+*   google no longer supports "I'm Feeling Lucky" 
+
+
+MSG
+
+
+#----- user input, parameters 
+
+if (grep /\P{ASCII}/ => @ARGV) { 
+   @ARGV = map { decode("UTF-8", $_) } @ARGV;
+}
+
+my $inputFilename= "/dev/null";
+my $ImFeelingLucky;
+my $ImFeelingLuckyPlus;
+my $massOpen=0;
+my $addrPrependStr=""; 
+my $doDupPrepend;
+my @searchStrs; 
+my $startNo=1;			# NB: not 0-based
+my $noRows=999;
+my $sleepSeconds=1;
+GetOptions(	
+			"i=s"			=> \$inputFilename,			
+			"lucky"			=> \$ImFeelingLucky,			
+			"lucky-plus"		=> \$ImFeelingLuckyPlus,			
+			"search:s"		=> \@searchStrs,	
+			"massOpen"		=> \$massOpen,
+			"start:i"		=> \$startNo,
+			"rows:i"		=> \$noRows,
+			"sleepSec:i"	=> \$sleepSeconds,
+			"prepend:i"		=> \$addrPrependStr,
+			"dupPrepend:i"	=> \$doDupPrepend,
+			);
+# rough check inputs exist
+if (	($inputFilename eq "/dev/null")) {
+	die "$usageMessage";
+}
+# massOpen OR search, not both.
+if (($massOpen) &&
+	(($ImFeelingLucky) || ($ImFeelingLuckyPlus) || (@searchStrs))  ){
+	print "\n\n--massOpen can not have any search options \n\n";
+	die "$usageMessage";
+}
+# fix up lucky options
+$ImFeelingLucky = () if (defined $ImFeelingLuckyPlus);
+#clean empty & comment lines out of input file
+`cat $inputFilename | grep -vE "^#|^\\s*\$|^\$" > $tempFile `;
+# prepends only when doing --massOpen
+if (($massOpen) && (($doDupPrepend ) || ($addrPrependStr))) {
+	print "\n\n Only can prepend to web addresses when doing --massOpen \n\n ";
+	print "$usageMessage";
+	exit (1); 
+}
+# only one 'prepend' option
+if (($doDupPrepend ) && ($addrPrependStr)) {
+	print "\n\neither use --prepend  or use --dupPrepend, not both\n\n";
+	print "$usageMessage";
+	exit (1); 
+}
+if ($doDupPrepend) {
+	$addrPrependStr = $doDupPrepend;
+	$doDupPrepend = 1; 
+}
+
+
+#--- Function: process search Strings
+
+sub processSearchStrings{
+
+	my $thisSS = shift;
+
+	$thisSS =~ s/ /\+/g;
+	$thisSS =~ s/\|/\|/g;
+	$thisSS = "\"".$thisSS."\"" if ($thisSS !~ /\|/) ;
+
+	# strip turkish company name shit (varsa)
+
+	$thisSS =~ s/ A.Ş.$//g;
+	$thisSS =~ s/ A.Ş$//g;
+	$thisSS =~ s/ A.Ş. $//g;
+	$thisSS =~ s/ A.Ş $//g;
+	$thisSS =~ s/ A.S.$//g;
+	$thisSS =~ s/ A.S$//g;
+	$thisSS =~ s/ A.S. $//g;
+	$thisSS =~ s/ A.S $//g;
+	$thisSS =~ s/ Ltd. Şti.$//g;
+	$thisSS =~ s/ Ltd. Şti. $//g;
+	$thisSS =~ s/ Ltd. Sti$//g;
+	$thisSS =~ s/ Ltd. Sti $//g;
+	$thisSS =~ s/ Ltd.Şti.$//g;
+	$thisSS =~ s/ Ltd.Şti. $//g;
+	$thisSS =~ s/ Ltd.Sti$//g;
+	$thisSS =~ s/ Ltd.Sti $//g;
+
+	return $thisSS;
+}
+
+#- call processSearchStrings() on each search parameter
+my $otherSearchStrs;
+{
+	@searchStrs = map{ processSearchStrings($_); } @searchStrs;
+	local $" = '+'; 
+	$otherSearchStrs = "@searchStrs";
+}
+
+	
+
+
+#----- infile processing loop			
+
+open (my $in, "<", $tempFile)  || die "Can\'t open $inputFilename:  $!\n\n$usageMessage"; 
+
+#binmode($in, ":utf8");    # if binary data
+#open ($out, "<",$outputFileName) or die "Can\'t open $outputFileName: $!";
+
+# over the input file
+my $line;
+my $queryString; 
+my $queryString_withPrepend; 
+while (<$in>)  {
+	next if ($. < ($startNo-1));
+	last if ($. >= ($startNo-1)+$noRows);   	
+					# NB: >= 	OK: 	i-th ... i+(noRows-1): OK 
+					#			stop: 	before process i+noRows row
+					#	  which is correct.
+	$line = $_;
+	chomp $line;
+	next if ($line eq "");
+	next if ($line =~ /^#/);
+
+	#- mass Open (no seach)
+	if ($massOpen) {
+		$queryString_withPrepend = $cmdPrefix.$addrPrependStr.$line." "	if ($addrPrependStr) ;
+		$queryString=$cmdPrefix.$line." ";
+	}
+	else
+	#- build the query string
+	{
+		my $ss=processSearchStrings( $line );
+
+		$queryString=$cmdPrefix.$googlePrefix.$ss.'+'.$otherSearchStrs;
+		$queryString=$queryString.$luckySuffix	if ($ImFeelingLucky);
+		$queryString=$queryString.$cmdSuffix;
+	}
+
+	#- run the query
+	`$queryString`;
+	print "ran: $queryString  \n";
+	sleep $sleepSeconds;
+	
+	# repeat with "Im Feeling Lucky" if ImFeelingLuck-Plus
+	# will not have been ImFeelingLucky in the previous few lines
+	if ($ImFeelingLuckyPlus) {
+		$queryString =~ s/$cmdSuffix/$luckySuffix.$cmdSuffix/g;
+    	`$queryString`;
+	    sleep $sleepSeconds;
+	}
+	# optionally repeat with 'prepend' query string 
+	if ($doDupPrepend) {
+		`$queryString_withPrepend`; 
+		sleep $sleepSeconds; 
+	}
+}
+
+close $in;
+`rm -f $tempFile`;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
